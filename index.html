@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Beam — Direct File Transfer</title>
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;700;800&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 <style>
   :root {
     --bg: #0a0a0f;
@@ -514,13 +515,21 @@
   <!-- ===== SENDER PANEL ===== -->
   <div id="sender-panel" class="panel visible">
 
-    <!-- Step 1: Pick files -->
-    <div class="panel-title">Step 1 — Choose Files</div>
-    <div class="dropzone" id="dropzone">
-      <input type="file" id="file-input" multiple>
-      <div class="drop-icon">📁</div>
-      <div class="drop-text">Drop files here or click to browse</div>
-      <div class="drop-hint">Any file type • Any size</div>
+    <!-- Step 1: Pick files or folder -->
+    <div class="panel-title">Step 1 — Choose Files or Folder</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px;">
+      <div class="dropzone" id="dropzone">
+        <input type="file" id="file-input" multiple>
+        <div class="drop-icon">📄</div>
+        <div class="drop-text">Files</div>
+        <div class="drop-hint">Drop or click</div>
+      </div>
+      <div class="dropzone" id="folder-dropzone" onclick="document.getElementById('folder-input').click()" style="cursor:pointer;">
+        <input type="file" id="folder-input" webkitdirectory style="display:none">
+        <div class="drop-icon">📂</div>
+        <div class="drop-text">Folder</div>
+        <div class="drop-hint">Click to pick folder</div>
+      </div>
     </div>
     <div class="file-list" id="file-list"></div>
 
@@ -559,14 +568,23 @@
     </div>
 
     <div class="progress-wrap" id="sender-progress">
+      <!-- Per-file progress -->
       <div class="progress-label">
-        <span id="progress-filename">Sending…</span>
+        <span id="progress-filename" style="max-width:60%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">Sending…</span>
         <span style="display:flex;gap:10px;align-items:center;">
           <span id="progress-speed" style="color:var(--accent);font-family:'Space Mono',monospace;font-size:10px;"></span>
           <span id="progress-pct">0%</span>
         </span>
       </div>
       <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
+      <!-- Total progress (folders) -->
+      <div id="total-progress-wrap" style="display:none; margin-top:10px;">
+        <div class="progress-label">
+          <span id="total-progress-label" style="color:var(--muted);">Total</span>
+          <span id="total-progress-pct" style="color:var(--muted);">0%</span>
+        </div>
+        <div class="progress-bar" style="height:4px;"><div class="progress-fill" id="total-progress-fill" style="background:linear-gradient(90deg,#ffd700,#ff8c00);"></div></div>
+      </div>
     </div>
 
   </div>
@@ -587,7 +605,7 @@
       <div style="background:rgba(0,255,178,0.06); border:1px solid rgba(0,255,178,0.2); border-radius:10px; padding:14px 16px; display:flex; align-items:center; justify-content:space-between; gap:12px;">
         <div>
           <div style="font-size:13px; font-weight:700; margin-bottom:3px;">💾 Stream to disk <span id="fsa-badge" style="font-size:10px; font-family:'Space Mono',monospace; color:var(--accent); background:rgba(0,255,178,0.12); padding:2px 7px; border-radius:20px; vertical-align:middle;">SUPPORTED</span></div>
-          <div style="font-size:11px; color:var(--muted); font-family:'Space Mono',monospace;">Write chunks directly to disk — no RAM limit. Recommended for large files.</div>
+          <div style="font-size:11px; color:var(--muted); font-family:'Space Mono',monospace;">Write directly to disk — no RAM limit. For folders, writes each file into a directory you choose. Required for 17GB+ transfers.</div>
         </div>
         <label style="position:relative; display:inline-block; width:44px; height:24px; flex-shrink:0; cursor:pointer;">
           <input type="checkbox" id="fsa-toggle" style="opacity:0;width:0;height:0;" onchange="toggleFSA(this.checked)">
@@ -620,13 +638,21 @@
 
     <div class="progress-wrap" id="receiver-progress">
       <div class="progress-label">
-        <span id="recv-filename">Receiving…</span>
+        <span id="recv-filename" style="max-width:60%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">Receiving…</span>
         <span style="display:flex;gap:10px;align-items:center;">
           <span id="recv-speed" style="color:var(--accent);font-family:'Space Mono',monospace;font-size:10px;"></span>
           <span id="recv-pct">0%</span>
         </span>
       </div>
       <div class="progress-bar"><div class="progress-fill" id="recv-fill"></div></div>
+      <!-- Total progress (folders) -->
+      <div id="recv-total-wrap" style="display:none; margin-top:10px;">
+        <div class="progress-label">
+          <span id="recv-total-label" style="color:var(--muted);">Total</span>
+          <span id="recv-total-pct" style="color:var(--muted);">0%</span>
+        </div>
+        <div class="progress-bar" style="height:4px;"><div class="progress-fill" id="recv-total-fill" style="background:linear-gradient(90deg,#ffd700,#ff8c00);"></div></div>
+      </div>
     </div>
 
     <div id="received-files" style="margin-top:16px;"></div>
@@ -684,28 +710,44 @@
   // ─── State ───────────────────────────────────────────────
   let pc = null;
   let dataChannel = null;
-  let filesToSend = [];
-  let currentFileIndex = 0;
   let sendWorker = null;
 
+  // Sender state
+  let filesToSend     = [];   // [{file, relativePath}]
+  let folderName      = '';   // set when a folder is picked
+  let isFolder        = false;
+  let currentFileIndex = 0;
+  let totalBytes      = 0;
+  let sentTotalBytes  = 0;
+
   // Receive state
-  let receiveBuffer = [];
-  let receivedSize  = 0;
-  let expectedSize  = 0;
-  let expectedName  = '';
-  let expectedType  = '';
+  let receiveBuffer    = [];
+  let receivedSize     = 0;
+  let expectedSize     = 0;
+  let expectedName     = '';
+  let expectedType     = '';
+  let recvIsFolder     = false;
+  let recvFolderName   = '';
+  let recvManifest     = [];   // [{path, size}] sorted
+  let recvFileIndex    = 0;
+  let recvTotalBytes   = 0;
+  let recvTotalReceived= 0;
+  let zipBuilder       = null; // JSZip instance for RAM mode
+  let fsaZipWritable   = null; // not used for folders (we use FSA dir instead)
+  let fsaDirHandle     = null; // FileSystemDirectoryHandle for folder FSA mode
 
   // File System Access API
   let fsaSupported = ('showSaveFilePicker' in window);
+  let fsaDirSupported = ('showDirectoryPicker' in window);
   let fsaWritable  = null;
   let fsaMode      = false;
 
   // Throughput / auto-tune
-  let chunkSize      = 256 * 1024;   // starts at 256KB, auto-tunes up to 1MB
-  const CHUNK_MAX    = 1024 * 1024;
-  const CHUNK_MIN    = 64  * 1024;
-  const BUFFER_HIGH  = 4   * 1024 * 1024;  // pause above 4MB buffered
-  const BUFFER_LOW   = 512 * 1024;          // resume below 512KB
+  let chunkSize     = 256 * 1024;
+  const CHUNK_MAX   = 1024 * 1024;
+  const CHUNK_MIN   = 64  * 1024;
+  const BUFFER_HIGH = 4   * 1024 * 1024;
+  const BUFFER_LOW  = 512 * 1024;
 
   // Speed tracking
   let speedBytes = 0, speedLastTime = 0, speedLastBytes = 0;
@@ -718,21 +760,29 @@
   // Pre-cached DOM refs
   const DOM = {};
   window.addEventListener('DOMContentLoaded', () => {
-    DOM.progressFill     = document.getElementById('progress-fill');
-    DOM.progressPct      = document.getElementById('progress-pct');
-    DOM.progressName     = document.getElementById('progress-filename');
-    DOM.progressSpeed    = document.getElementById('progress-speed');
-    DOM.senderProgress   = document.getElementById('sender-progress');
-    DOM.recvFill         = document.getElementById('recv-fill');
-    DOM.recvPct          = document.getElementById('recv-pct');
-    DOM.recvFilename     = document.getElementById('recv-filename');
-    DOM.recvSpeed        = document.getElementById('recv-speed');
-    DOM.receiverProgress = document.getElementById('receiver-progress');
-    DOM.senderDot        = document.getElementById('sender-status-dot');
-    DOM.senderText       = document.getElementById('sender-status-text');
-    DOM.receiverDot      = document.getElementById('receiver-status-dot');
-    DOM.receiverText     = document.getElementById('receiver-status-text');
-    DOM.receivedFiles    = document.getElementById('received-files');
+    DOM.progressFill      = document.getElementById('progress-fill');
+    DOM.progressPct       = document.getElementById('progress-pct');
+    DOM.progressName      = document.getElementById('progress-filename');
+    DOM.progressSpeed     = document.getElementById('progress-speed');
+    DOM.senderProgress    = document.getElementById('sender-progress');
+    DOM.totalWrap         = document.getElementById('total-progress-wrap');
+    DOM.totalFill         = document.getElementById('total-progress-fill');
+    DOM.totalPct          = document.getElementById('total-progress-pct');
+    DOM.totalLabel        = document.getElementById('total-progress-label');
+    DOM.recvFill          = document.getElementById('recv-fill');
+    DOM.recvPct           = document.getElementById('recv-pct');
+    DOM.recvFilename      = document.getElementById('recv-filename');
+    DOM.recvSpeed         = document.getElementById('recv-speed');
+    DOM.receiverProgress  = document.getElementById('receiver-progress');
+    DOM.recvTotalWrap     = document.getElementById('recv-total-wrap');
+    DOM.recvTotalFill     = document.getElementById('recv-total-fill');
+    DOM.recvTotalPct      = document.getElementById('recv-total-pct');
+    DOM.recvTotalLabel    = document.getElementById('recv-total-label');
+    DOM.senderDot         = document.getElementById('sender-status-dot');
+    DOM.senderText        = document.getElementById('sender-status-text');
+    DOM.receiverDot       = document.getElementById('receiver-status-dot');
+    DOM.receiverText      = document.getElementById('receiver-status-text');
+    DOM.receivedFiles     = document.getElementById('received-files');
     document.getElementById('btn-create-offer').disabled = true;
     document.getElementById('btn-connect').disabled = true;
   });
@@ -747,24 +797,43 @@
   }
 
   // ─── File picking ─────────────────────────────────────────
-  const dropzone = document.getElementById('dropzone');
-  const fileInput = document.getElementById('file-input');
+  const dropzone    = document.getElementById('dropzone');
+  const fileInput   = document.getElementById('file-input');
+  const folderInput = document.getElementById('folder-input');
 
-  fileInput.addEventListener('change', e => addFiles(Array.from(e.target.files)));
+  fileInput.addEventListener('change', e => {
+    isFolder = false; folderName = '';
+    addFiles(Array.from(e.target.files).map(f => ({ file: f, relativePath: f.name })));
+  });
+
+  folderInput.addEventListener('change', e => {
+    const files = Array.from(e.target.files);
+    if (!files.length) return;
+    isFolder = true;
+    // webkitRelativePath = "FolderName/sub/file.ext"
+    folderName = files[0].webkitRelativePath.split('/')[0];
+    // Sort by full path to preserve folder order deterministically
+    files.sort((a, b) => a.webkitRelativePath.localeCompare(b.webkitRelativePath));
+    filesToSend = files.map(f => ({ file: f, relativePath: f.webkitRelativePath }));
+    totalBytes  = filesToSend.reduce((s, x) => s + x.file.size, 0);
+    renderFileList();
+    document.getElementById('btn-create-offer').disabled = false;
+  });
+
   dropzone.addEventListener('dragover', e => { e.preventDefault(); dropzone.classList.add('drag-over'); });
   dropzone.addEventListener('dragleave', () => dropzone.classList.remove('drag-over'));
   dropzone.addEventListener('drop', e => {
-    e.preventDefault();
-    dropzone.classList.remove('drag-over');
-    addFiles(Array.from(e.dataTransfer.files));
+    e.preventDefault(); dropzone.classList.remove('drag-over');
+    isFolder = false; folderName = '';
+    addFiles(Array.from(e.dataTransfer.files).map(f => ({ file: f, relativePath: f.name })));
   });
 
-  function addFiles(files) {
-    files.forEach(f => {
-      if (!filesToSend.find(x => x.name === f.name && x.size === f.size)) {
-        filesToSend.push(f);
-      }
+  function addFiles(entries) {
+    entries.forEach(({ file, relativePath }) => {
+      if (!filesToSend.find(x => x.relativePath === relativePath && x.file.size === file.size))
+        filesToSend.push({ file, relativePath });
     });
+    totalBytes = filesToSend.reduce((s, x) => s + x.file.size, 0);
     renderFileList();
     document.getElementById('btn-create-offer').disabled = filesToSend.length === 0;
   }
@@ -772,28 +841,50 @@
   function renderFileList() {
     const list = document.getElementById('file-list');
     list.innerHTML = '';
-    filesToSend.forEach((f, i) => {
+    if (isFolder) {
+      // Show folder summary
       const div = document.createElement('div');
       div.className = 'file-item';
       div.innerHTML = `
-        <span class="file-icon">${fileIcon(f.name)}</span>
+        <span class="file-icon">📂</span>
         <div class="file-info">
-          <div class="file-name">${f.name}</div>
-          <div class="file-size">${formatSize(f.size)}</div>
+          <div class="file-name">${folderName}</div>
+          <div class="file-size">${filesToSend.length} files • ${formatSize(totalBytes)}</div>
         </div>
-        <button class="file-remove" onclick="removeFile(${i})">✕</button>
+        <button class="file-remove" onclick="clearAll()">✕</button>
       `;
       list.appendChild(div);
-    });
+    } else {
+      filesToSend.forEach(({ file, relativePath }, i) => {
+        const div = document.createElement('div');
+        div.className = 'file-item';
+        div.innerHTML = `
+          <span class="file-icon">${fileIcon(file.name)}</span>
+          <div class="file-info">
+            <div class="file-name">${relativePath}</div>
+            <div class="file-size">${formatSize(file.size)}</div>
+          </div>
+          <button class="file-remove" onclick="removeFile(${i})">✕</button>
+        `;
+        list.appendChild(div);
+      });
+    }
+  }
+
+  function clearAll() {
+    filesToSend = []; isFolder = false; folderName = ''; totalBytes = 0;
+    renderFileList();
+    document.getElementById('btn-create-offer').disabled = true;
   }
 
   function removeFile(i) {
     filesToSend.splice(i, 1);
+    totalBytes = filesToSend.reduce((s, x) => s + x.file.size, 0);
     renderFileList();
   }
 
   function fileIcon(name) {
-    const ext = name.split('.').pop().toLowerCase();
+    const ext = (name.split('.').pop() || '').toLowerCase();
     if (['jpg','jpeg','png','gif','webp','svg'].includes(ext)) return '🖼️';
     if (['mp4','mov','avi','mkv','webm'].includes(ext)) return '🎬';
     if (['mp3','wav','flac','aac','ogg'].includes(ext)) return '🎵';
@@ -816,22 +907,15 @@
   // ─── WebRTC: Sender ───────────────────────────────────────
   async function createOffer() {
     if (filesToSend.length === 0) return;
-
     senderStatus('connecting', 'Creating connection…');
-
     pc = new RTCPeerConnection({ iceServers });
     dataChannel = pc.createDataChannel('files', { ordered: true });
     setupDataChannel(dataChannel);
 
     pc.onicecandidate = e => {
       if (!e.candidate) {
-        // ICE gathering complete — show full SDP
         const sdp = btoa(JSON.stringify(pc.localDescription));
-        document.getElementById('offer-sdp').childNodes[0]
-          ? document.getElementById('offer-sdp').firstChild.textContent = sdp
-          : null;
-        document.getElementById('offer-sdp').innerHTML =
-          `<span class="copy-hint">CLICK TO COPY</span>${sdp}`;
+        document.getElementById('offer-sdp').innerHTML = `<span class="copy-hint">CLICK TO COPY</span>${sdp}`;
         document.getElementById('offer-box-wrap').style.display = 'block';
         document.getElementById('btn-connect').disabled = false;
         senderStatus('connecting', 'Share your code — waiting for friend…');
@@ -840,12 +924,11 @@
 
     pc.oniceconnectionstatechange = () => {
       if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
-        senderStatus('connected', 'Connected! Sending files…');
-        sendNextFile();
+        senderStatus('connected', isFolder ? `Sending folder "${folderName}"…` : 'Connected! Sending files…');
+        startSending();
       }
-      if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected') {
+      if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected')
         senderStatus('error', 'Connection lost.');
-      }
     };
 
     const offer = await pc.createOffer();
@@ -858,12 +941,9 @@
     try {
       const answer = JSON.parse(atob(raw));
       await pc.setRemoteDescription(new RTCSessionDescription(answer));
-    } catch(e) {
-      senderStatus('error', 'Invalid reply code. Try again.');
-    }
+    } catch(e) { senderStatus('error', 'Invalid reply code. Try again.'); }
   }
 
-  // Listen to answer input changes
   document.getElementById('answer-input').addEventListener('input', function() {
     document.getElementById('btn-connect').disabled = !this.value.trim();
   });
@@ -872,24 +952,17 @@
   async function createAnswer() {
     const raw = document.getElementById('offer-input').value.trim();
     if (!raw) return;
-
     receiverStatus('connecting', 'Connecting…');
-
     try {
       const offer = JSON.parse(atob(raw));
       pc = new RTCPeerConnection({ iceServers });
-
-      pc.ondatachannel = e => {
-        setupDataChannel(e.channel);
-      };
+      pc.ondatachannel = e => setupDataChannel(e.channel);
 
       pc.onicecandidate = e => {
         if (!e.candidate) {
           const sdp = btoa(JSON.stringify(pc.localDescription));
-          document.getElementById('answer-sdp').innerHTML =
-            `<span class="copy-hint">CLICK TO COPY</span>${sdp}`;
+          document.getElementById('answer-sdp').innerHTML = `<span class="copy-hint">CLICK TO COPY</span>${sdp}`;
           document.getElementById('answer-box-wrap').style.display = 'block';
-          // Show FSA toggle
           document.getElementById('fsa-toggle-wrap').style.display = 'block';
           if (!fsaSupported) {
             document.getElementById('fsa-badge').textContent = 'NOT SUPPORTED';
@@ -902,53 +975,188 @@
       };
 
       pc.oniceconnectionstatechange = () => {
-        if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+        if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed')
           receiverStatus('connected', 'Connected! Waiting for files…');
-        }
-        if (pc.iceConnectionState === 'failed') {
+        if (pc.iceConnectionState === 'failed')
           receiverStatus('error', 'Connection failed.');
-        }
       };
 
       await pc.setRemoteDescription(new RTCSessionDescription(offer));
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
-    } catch(e) {
-      receiverStatus('error', 'Invalid code. Try again.');
-    }
+    } catch(e) { receiverStatus('error', 'Invalid code. Try again.'); }
   }
 
-  // ─── Data channel ─────────────────────────────────────────
+  // ─── Sending: manifest + files ────────────────────────────
+  function startSending() {
+    sentTotalBytes = 0;
+    currentFileIndex = 0;
+    // Send manifest first — receiver knows what's coming, in order
+    const manifest = filesToSend.map(({ file, relativePath }) => ({
+      path: relativePath, size: file.size, mimeType: file.type || 'application/octet-stream'
+    }));
+    dataChannel.send(JSON.stringify({
+      type: 'manifest',
+      isFolder,
+      folderName,
+      totalBytes,
+      files: manifest
+    }));
+    if (isFolder) {
+      DOM.totalWrap.style.display = 'block';
+      DOM.totalLabel.textContent = `0 / ${filesToSend.length} files`;
+    }
+    sendNextFile();
+  }
+
+  function sendNextFile() {
+    if (currentFileIndex >= filesToSend.length) {
+      dataChannel.send(JSON.stringify({ type: 'all-done', count: filesToSend.length, isFolder, folderName }));
+      senderStatus('connected', `✓ ${isFolder ? `Folder "${folderName}"` : `${filesToSend.length} file(s)`} sent!`);
+      DOM.senderProgress.classList.remove('visible');
+      if (sendWorker) { sendWorker.terminate(); sendWorker = null; }
+      return;
+    }
+    const { file, relativePath } = filesToSend[currentFileIndex];
+    DOM.senderProgress.classList.add('visible');
+    DOM.progressName.textContent = relativePath.split('/').pop();
+    updateSendProgress(0, '');
+    dataChannel.send(JSON.stringify({
+      type: 'file-start', name: relativePath,
+      size: file.size, mimeType: file.type || 'application/octet-stream'
+    }));
+    speedBytes = 0; speedLastTime = performance.now(); speedLastBytes = 0;
+    chunkSize = 256 * 1024;
+    pumpFileWorker(file);
+  }
+
+  // Worker-based pump with double-buffering and auto-tune
+  function pumpFileWorker(file) {
+    dataChannel.bufferedAmountLowThreshold = BUFFER_LOW;
+    if (sendWorker) sendWorker.terminate();
+    sendWorker = new Worker(workerURL);
+
+    let pendingBuf = null, workerDone = false;
+    let lastRaf = 0, tuneWindow = 0, tuneTime = performance.now();
+
+    const trySend = () => {
+      if (!pendingBuf) return;
+      if (dataChannel.bufferedAmount >= BUFFER_HIGH) {
+        dataChannel.onbufferedamountlow = () => { dataChannel.onbufferedamountlow = null; trySend(); };
+        return;
+      }
+      const buf = pendingBuf; pendingBuf = null;
+      const bytes = buf.byteLength;
+      dataChannel.send(buf);
+      sentTotalBytes += bytes;
+
+      // Auto-tune
+      tuneWindow += bytes;
+      const now = performance.now(), dt = now - tuneTime;
+      if (dt >= 500 && tuneWindow > 0) {
+        const mbps = tuneWindow / dt / 1000;
+        if (mbps > 5 && chunkSize < CHUNK_MAX)      chunkSize = Math.min(chunkSize * 2, CHUNK_MAX);
+        else if (mbps < 1 && chunkSize > CHUNK_MIN) chunkSize = Math.max(chunkSize >> 1, CHUNK_MIN);
+        tuneWindow = 0; tuneTime = now;
+        sendWorker.postMessage({ type: 'resize', chunkSize });
+      }
+
+      // Speed meter ~4/s
+      speedBytes += bytes;
+      if (now - lastRaf > 250) {
+        lastRaf = now;
+        const elapsed = (now - speedLastTime) / 1000;
+        const speed   = elapsed > 0 ? (speedBytes - speedLastBytes) / elapsed : 0;
+        speedLastBytes = speedBytes; speedLastTime = now;
+        updateSendProgress(Math.round((speedBytes / file.size) * 100), formatSpeed(speed));
+        // Total progress
+        if (isFolder && totalBytes > 0) {
+          const tpct = Math.round((sentTotalBytes / totalBytes) * 100);
+          DOM.totalFill.style.width = tpct + '%';
+          DOM.totalPct.textContent  = tpct + '%';
+          DOM.totalLabel.textContent = `${currentFileIndex + 1} / ${filesToSend.length} files`;
+        }
+      }
+      if (!workerDone) sendWorker.postMessage({ type: 'ack' });
+    };
+
+    sendWorker.onmessage = ({ data: msg }) => {
+      if (msg.type === 'chunk') { pendingBuf = msg.buf; trySend(); }
+      else if (msg.type === 'done') {
+        workerDone = true;
+        updateSendProgress(100, '');
+        dataChannel.send(JSON.stringify({ type: 'file-end', name: filesToSend[currentFileIndex].relativePath }));
+        currentFileIndex++;
+        sendNextFile();
+      }
+    };
+    sendWorker.postMessage({ type: 'init', file, chunkSize });
+  }
+
+  // ─── Data channel (receiver) ──────────────────────────────
   function setupDataChannel(channel) {
     channel.binaryType = 'arraybuffer';
     dataChannel = channel;
-
     let lastRecvRaf = 0, recvSpeedBytes = 0, recvSpeedLast = 0, recvSpeedLastTime = 0;
 
     channel.onmessage = async e => {
       if (typeof e.data === 'string') {
         const meta = JSON.parse(e.data);
 
-        if (meta.type === 'file-start') {
+        if (meta.type === 'manifest') {
+          // Folder/batch manifest — receiver knows everything upfront
+          recvIsFolder    = meta.isFolder;
+          recvFolderName  = meta.folderName;
+          recvManifest    = meta.files;  // already sorted by sender
+          recvFileIndex   = 0;
+          recvTotalBytes  = meta.totalBytes;
+          recvTotalReceived = 0;
+          if (recvIsFolder) {
+            DOM.recvTotalWrap.style.display = 'block';
+            DOM.recvTotalLabel.textContent = `0 / ${recvManifest.length} files`;
+            // In RAM mode, initialise JSZip
+            if (!fsaMode) zipBuilder = new JSZip();
+          }
+          receiverStatus('connected', recvIsFolder
+            ? `Receiving folder "${recvFolderName}" (${recvManifest.length} files, ${formatSize(recvTotalBytes)})`
+            : `Receiving ${recvManifest.length} file(s)…`);
+
+        } else if (meta.type === 'file-start') {
           receivedSize = 0; recvSpeedBytes = 0;
           recvSpeedLast = 0; recvSpeedLastTime = performance.now();
-          expectedSize = meta.size;
-          expectedName = meta.name;
-          expectedType = meta.mimeType;
+          expectedSize = meta.size; expectedName = meta.name; expectedType = meta.mimeType;
           DOM.receiverProgress.classList.add('visible');
-          DOM.recvFilename.textContent = meta.name;
+          // Show just filename (not full path) in progress bar
+          DOM.recvFilename.textContent = meta.name.split('/').pop();
           updateRecvProgress(0);
-          receiverStatus('connected', `Receiving: ${meta.name}`);
+          receiverStatus('connected', `Receiving: ${meta.name.split('/').pop()}`);
 
-          if (fsaMode) {
+          if (fsaMode && !recvIsFolder) {
+            // Single file FSA mode
             try {
               const fh = await window.showSaveFilePicker({
-                suggestedName: meta.name,
+                suggestedName: meta.name.split('/').pop(),
                 types: [{ description: 'File', accept: { [meta.mimeType || 'application/octet-stream']: [] } }]
               });
               fsaWritable = await fh.createWritable();
-            } catch(err) {
-              fsaWritable = null;
+            } catch(err) { fsaWritable = null; receiveBuffer = []; }
+          } else if (fsaMode && recvIsFolder) {
+            // Folder FSA mode — write directly into a chosen directory
+            if (!fsaDirHandle) {
+              try {
+                fsaDirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+              } catch(err) { fsaDirHandle = null; }
+            }
+            if (fsaDirHandle) {
+              // Create subdirectory tree as needed
+              const parts = meta.name.split('/');  // e.g. ["WatchDogs","data","file.bin"]
+              let dir = fsaDirHandle;
+              for (let i = 0; i < parts.length - 1; i++) {
+                dir = await dir.getDirectoryHandle(parts[i], { create: true });
+              }
+              const fh = await dir.getFileHandle(parts[parts.length - 1], { create: true });
+              fsaWritable = await fh.createWritable();
+            } else {
               receiveBuffer = [];
             }
           } else {
@@ -958,25 +1166,64 @@
         } else if (meta.type === 'file-end') {
           updateRecvProgress(100);
           if (fsaMode && fsaWritable) {
-            await fsaWritable.close();
-            fsaWritable = null;
-            addReceivedFileSaved(expectedName, expectedSize);
+            await fsaWritable.close(); fsaWritable = null;
+          } else if (recvIsFolder && zipBuilder) {
+            // Add completed file to zip
+            const blob = new Blob(receiveBuffer, { type: expectedType });
+            zipBuilder.file(expectedName, blob);
+            receiveBuffer = [];
           } else {
             const blob = new Blob(receiveBuffer, { type: expectedType });
-            addReceivedFile(expectedName, expectedSize, blob);
+            addReceivedFile(expectedName.split('/').pop(), expectedSize, blob);
             receiveBuffer = [];
           }
+          recvTotalReceived += expectedSize;
           receivedSize = 0;
-          receiverStatus('connected', 'File saved! Waiting for more…');
+          recvFileIndex++;
+
+          // Update total progress
+          if (recvIsFolder) {
+            const tpct = recvTotalBytes > 0 ? Math.round((recvTotalReceived / recvTotalBytes) * 100) : 0;
+            DOM.recvTotalFill.style.width = tpct + '%';
+            DOM.recvTotalPct.textContent  = tpct + '%';
+            DOM.recvTotalLabel.textContent = `${recvFileIndex} / ${recvManifest.length} files`;
+          }
+          if (!recvIsFolder) receiverStatus('connected', 'File saved! Waiting for more…');
 
         } else if (meta.type === 'all-done') {
-          receiverStatus('connected', `All ${meta.count} file(s) received ✓`);
+          if (recvIsFolder) {
+            if (fsaMode && fsaDirHandle) {
+              // All files written to disk directory
+              fsaDirHandle = null;
+              addReceivedFolderSaved(recvFolderName, recvTotalBytes, recvManifest.length);
+              receiverStatus('connected', `✓ Folder "${recvFolderName}" saved to your chosen directory!`);
+            } else if (zipBuilder) {
+              // Generate single ZIP
+              receiverStatus('connected', `Zipping "${recvFolderName}"… please wait`);
+              const zipBlob = await zipBuilder.generateAsync({
+                type: 'blob',
+                compression: 'STORE',   // no compression = max speed, preserve exact bytes
+                streamFiles: true
+              }, meta => {
+                const p = Math.round(meta.percent);
+                DOM.recvTotalFill.style.width = p + '%';
+                DOM.recvTotalPct.textContent  = p + '%';
+                DOM.recvTotalLabel.textContent = 'Zipping…';
+              });
+              zipBuilder = null;
+              addReceivedFile(recvFolderName + '.zip', zipBlob.size, zipBlob);
+              receiverStatus('connected', `✓ Folder ready as ${recvFolderName}.zip`);
+            }
+          } else {
+            receiverStatus('connected', `✓ All ${meta.count} file(s) received`);
+          }
         }
 
       } else {
         // Binary chunk — hot path
-        receivedSize   += e.data.byteLength;
-        recvSpeedBytes += e.data.byteLength;
+        receivedSize     += e.data.byteLength;
+        recvSpeedBytes   += e.data.byteLength;
+        recvTotalReceived += e.data.byteLength; // live total tracking
 
         if (fsaMode && fsaWritable) {
           await fsaWritable.write(e.data);
@@ -984,18 +1231,13 @@
           receiveBuffer.push(e.data);
         }
 
-        // Throttle DOM to ~4 updates/sec
         const now = performance.now();
         if (now - lastRecvRaf > 250) {
           lastRecvRaf = now;
           const elapsed = (now - recvSpeedLastTime) / 1000;
           const speed   = elapsed > 0 ? (recvSpeedBytes - recvSpeedLast) / elapsed : 0;
-          recvSpeedLast     = recvSpeedBytes;
-          recvSpeedLastTime = now;
-          updateRecvProgress(
-            Math.round((receivedSize / expectedSize) * 100),
-            formatSpeed(speed)
-          );
+          recvSpeedLast = recvSpeedBytes; recvSpeedLastTime = now;
+          updateRecvProgress(Math.round((receivedSize / expectedSize) * 100), formatSpeed(speed));
         }
       }
     };
@@ -1004,109 +1246,6 @@
       senderStatus('error', 'Channel error.');
       receiverStatus('error', 'Channel error.');
     };
-  }
-
-  // ─── Sending files ────────────────────────────────────────
-  function sendNextFile() {
-    if (currentFileIndex >= filesToSend.length) {
-      dataChannel.send(JSON.stringify({ type: 'all-done', count: filesToSend.length }));
-      senderStatus('connected', `All ${filesToSend.length} file(s) sent! ✓`);
-      DOM.senderProgress.classList.remove('visible');
-      if (sendWorker) { sendWorker.terminate(); sendWorker = null; }
-      return;
-    }
-    const file = filesToSend[currentFileIndex];
-    DOM.senderProgress.classList.add('visible');
-    DOM.progressName.textContent = file.name;
-    updateSendProgress(0, '');
-    dataChannel.send(JSON.stringify({
-      type: 'file-start', name: file.name,
-      size: file.size, mimeType: file.type || 'application/octet-stream'
-    }));
-    // Reset speed tracking
-    speedBytes = 0; speedLastTime = performance.now(); speedLastBytes = 0;
-    // Reset chunk size tuning per file
-    chunkSize = 256 * 1024;
-    pumpFileWorker(file);
-  }
-
-  // Worker-based pump with double-buffering and auto-tune
-  function pumpFileWorker(file) {
-    dataChannel.bufferedAmountLowThreshold = BUFFER_LOW;
-
-    // Terminate any previous worker
-    if (sendWorker) sendWorker.terminate();
-    sendWorker = new Worker(workerURL);
-
-    let pendingBuf   = null;   // chunk pre-read by worker, waiting to send
-    let workerDone   = false;
-    let lastRaf      = 0;
-    let tuneWindow   = 0;      // bytes sent since last tune
-    let tuneTime     = performance.now();
-
-    const trySend = () => {
-      if (!pendingBuf) return;
-      if (dataChannel.bufferedAmount >= BUFFER_HIGH) {
-        // Buffer full — wait for low event then retry
-        dataChannel.onbufferedamountlow = () => { dataChannel.onbufferedamountlow = null; trySend(); };
-        return;
-      }
-      const buf    = pendingBuf;
-      pendingBuf   = null;
-      const bytes  = buf.byteLength;
-
-      dataChannel.send(buf);   // buf is already a transferable from the worker
-
-      // ── Auto-tune chunk size based on throughput ──────────
-      tuneWindow += bytes;
-      const now   = performance.now();
-      const dt    = now - tuneTime;
-      if (dt >= 500 && tuneWindow > 0) {          // sample every 500ms
-        const mbps = (tuneWindow / dt / 1000);    // KB/ms ≈ MB/s
-        // Ramp up if throughput is healthy, back off if buffer builds fast
-        if (mbps > 5 && chunkSize < CHUNK_MAX)      chunkSize = Math.min(chunkSize * 2, CHUNK_MAX);
-        else if (mbps < 1 && chunkSize > CHUNK_MIN) chunkSize = Math.max(chunkSize >> 1, CHUNK_MIN);
-        tuneWindow = 0; tuneTime = now;
-        // Update worker with new chunk size
-        sendWorker.postMessage({ type: 'resize', chunkSize });
-      }
-
-      // ── Speed meter (throttled to ~4/s) ──────────────────
-      speedBytes += bytes;
-      if (now - lastRaf > 250) {
-        lastRaf = now;
-        const elapsed  = (now - speedLastTime) / 1000;
-        const speed    = elapsed > 0 ? (speedBytes - speedLastBytes) / elapsed : 0;
-        speedLastBytes = speedBytes;
-        speedLastTime  = now;
-        updateSendProgress(
-          Math.round((speedBytes / file.size) * 100),
-          formatSpeed(speed)
-        );
-      }
-
-      // Ask worker for next chunk
-      if (!workerDone) sendWorker.postMessage({ type: 'ack' });
-    };
-
-    sendWorker.onmessage = ({ data: msg }) => {
-      if (msg.type === 'chunk') {
-        pendingBuf = msg.buf;   // zero-copy: transferred ArrayBuffer
-        trySend();
-      } else if (msg.type === 'done') {
-        workerDone = true;
-        // Flush final progress
-        updateSendProgress(100, '');
-        dataChannel.send(JSON.stringify({ type: 'file-end', name: file.name }));
-        currentFileIndex++;
-        sendNextFile();
-      } else if (msg.type === 'resize-ack') {
-        // Worker acknowledged resize — no-op
-      }
-    };
-
-    // Kick off worker
-    sendWorker.postMessage({ type: 'init', file, chunkSize });
   }
 
   // ─── Received files UI ────────────────────────────────────
@@ -1133,6 +1272,20 @@
       <div class="file-info">
         <div class="file-name">${name}</div>
         <div class="file-size">${formatSize(size)}</div>
+      </div>
+      <span class="dl-btn" style="background:rgba(0,255,178,0.15);color:var(--accent);cursor:default;">✓ Saved</span>
+    `;
+    DOM.receivedFiles.prepend(div);
+  }
+
+  function addReceivedFolderSaved(name, size, fileCount) {
+    const div = document.createElement('div');
+    div.className = 'received-file';
+    div.innerHTML = `
+      <span style="font-size:22px">📂</span>
+      <div class="file-info">
+        <div class="file-name">${name}/</div>
+        <div class="file-size">${fileCount} files • ${formatSize(size)} — saved to chosen folder</div>
       </div>
       <span class="dl-btn" style="background:rgba(0,255,178,0.15);color:var(--accent);cursor:default;">✓ Saved</span>
     `;

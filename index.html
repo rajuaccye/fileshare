@@ -346,6 +346,9 @@ body::before {
         </div>
       </div>
       <div id="recv-done-files" style="margin-top:12px;"></div>
+      <div id="recv-download-all-wrap" style="display:none;margin-top:12px;text-align:center;">
+        <button class="btn btn-primary" id="btn-download-all" onclick="downloadAllAsZip()">📦 Download All Files as ZIP</button>
+      </div>
     </div>
   </div>
 </div>
@@ -401,6 +404,7 @@ let recvFileIndex  = 0;
 let recvTotalBytes = 0;
 let recvTotalRecvd = 0;
 let zipBuilder     = null;
+let receivedBlobs  = [];
 let fsaWritable    = null;
 let fsaDirHandle   = null;
 let fsaFileHandle  = null;
@@ -755,6 +759,29 @@ function setupRecvChannel(conn) {
       fsaMode = false;
     }
 
+    // Universal fallback destination prompt — works on every browser.
+    // The chosen name is used for the auto-generated ZIP (folder / multi-file)
+    // or as the suggested filename for the single file. Browsers configured to
+    // "always ask where to save" will then surface a native location picker.
+    if (!fsaMode) {
+      const isBatch = recvIsFolder || recvManifest.length > 1;
+      const defaultName = isBatch
+        ? (recvFolderName || 'beam-transfer')
+        : (recvManifest[0] ? recvManifest[0].path.split('/').pop().replace(/\.[^.]+$/,'') : 'download');
+      const promptLabel = isBatch
+        ? 'Name your download package (will be saved as a .zip in your browser\'s downloads folder):'
+        : 'Name this download (saved to your browser\'s downloads folder):';
+      const chosen = window.prompt(promptLabel, defaultName);
+      if (chosen && chosen.trim()) {
+        if (isBatch) {
+          recvFolderName = chosen.trim().replace(/\.zip$/i,'');
+        } else {
+          // override the single incoming file name
+          recvManifest[0].path = chosen.trim() + (recvManifest[0].path.match(/\.[^./]+$/)?.[0] || '');
+        }
+      }
+    }
+
     if (recvIsFolder && !fsaMode) {
       zipBuilder = new JSZip();
     }
@@ -878,8 +905,12 @@ function setupRecvChannel(conn) {
             setRecvStatus('connected',`✓ Natively routed all ${meta.count} file(s) safely straight to disk!`);
           } else {
             setRecvStatus('connected',`✓ Processed all ${meta.count} file(s). Use local download targets below.`);
+            if (receivedBlobs.length > 1) {
+              document.getElementById('recv-download-all-wrap').style.display='block';
+            }
           }
         }
+        // For folder-mode ZIP fallback, the single zip is already in receivedBlobs; no batch needed.
       }
 
     } else {
@@ -934,7 +965,7 @@ function resetRecvState() {
   receiveBuffer=[]; receivedSize=0; expectedSize=0;
   recvIsFolder=false; recvFolderName=''; recvManifest=[];
   recvFileIndex=0; recvTotalBytes=0; recvTotalRecvd=0;
-  zipBuilder=null; fsaWritable=null; fsaDirHandle=null; fsaFileHandle=null;
+  zipBuilder=null; fsaWritable=null; fsaDirHandle=null; fsaFileHandle=null; receivedBlobs=[];
   document.getElementById('recv-code-input').value='';
   document.getElementById('recv-status-card').style.display='none';
   document.getElementById('recv-err').classList.remove('show');
@@ -942,6 +973,8 @@ function resetRecvState() {
   document.getElementById('recv-done-files').innerHTML='';
   document.getElementById('fsa-wrap-recv').style.display='none';
   document.getElementById('recv-accept-container').style.display='none';
+  document.getElementById('recv-download-all-wrap').style.display='none';
+  document.getElementById('custom-dest-wrap')?.style.setProperty('display','none');
 }
 
 // ══════════════════════════════════════════════════════
@@ -966,11 +999,30 @@ function updateRecvProgress(pct, speed) {
   if (speed!==undefined) document.getElementById('recv-speed').textContent=speed;
 }
 function addReceivedFile(name, size, blob) {
+  receivedBlobs.push({name, blob});
   const url=URL.createObjectURL(blob);
   const div=document.createElement('div'); div.className='received-file';
   div.innerHTML=`<span style="font-size:20px">${fileIcon(name)}</span><div class="file-info"><div class="file-name">${name}</div><div class="file-size">${formatSize(size)}</div></div><a class="dl-btn" href="${url}" download="${name}">⬇ Save</a>`;
   document.getElementById('recv-done-files').prepend(div);
 }
+async function downloadAllAsZip() {
+  if (!receivedBlobs.length) return;
+  const btn=document.getElementById('btn-download-all');
+  btn.disabled=true; btn.textContent='📦 Packaging…';
+  const zip=new JSZip();
+  receivedBlobs.forEach(({name,blob})=>zip.file(name,blob));
+  const archiveName=(recvFolderName||'beam-transfer')+'.zip';
+  const zipBlob=await zip.generateAsync({type:'blob',compression:'STORE',streamFiles:true},m=>{
+    btn.textContent='📦 Packaging… '+Math.round(m.percent)+'%';
+  });
+  const url=URL.createObjectURL(zipBlob);
+  const a=document.createElement('a');
+  a.href=url; a.download=archiveName;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=>URL.revokeObjectURL(url),1000);
+  btn.disabled=false; btn.textContent='✓ Downloaded — Pack Again';
+}
+
 function addReceivedFolderSaved(name, size, count) {
   const div=document.createElement('div'); div.className='received-file';
   div.innerHTML=`<span style="font-size:20px">📂</span><div class="file-info"><div class="file-name">${name}/</div><div class="file-size">${count} files • ${formatSize(size)}</div></div><span class="dl-btn" style="background:rgba(0,255,178,0.15);color:var(--accent);cursor:default;">✓ Saved to Storage</span>`;
